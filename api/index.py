@@ -37,16 +37,19 @@ class ChatRequest(BaseModel):
     message: str
     history: list = []
 
+class SQLResponseSchema(BaseModel):
+    sql_query: str
+
 # Schema definition for system prompt guidance
 DB_SCHEMA = """
 Table Name: cars
 Columns:
 - car_name: string (e.g. 'Maruti Alto', 'Hyundai Grand')
-- brand: string (e.g. 'Maruti', 'Hyundai', 'Ford')
-- model: string (e.g. 'Alto', 'Grand', 'i20')
+- brand: string (e.g. 'Maruti', 'Hyundai', 'Honda', 'Ford', 'Skoda', 'Volkswagen', 'Toyota', 'Renault', 'Mahindra', 'Tata')
+- model: string (e.g. 'Alto', 'Grand', 'i20', 'Wagon R', 'Rapid', 'City', 'Civic', 'Ecosport')
 - vehicle_age: integer (age in years, e.g. 9, 5)
 - km_driven: integer (e.g. 120000, 20000)
-- seller_type: string ('Individual' or 'Dealer')
+- seller_type: string ('Individual', 'Dealer', 'Trustmark Dealer')
 - fuel_type: string ('Petrol', 'Diesel', 'CNG', 'LPG', 'Electric')
 - transmission_type: string ('Manual', 'Automatic')
 - mileage: float (km per liter, e.g. 19.7, 18.9)
@@ -56,18 +59,24 @@ Columns:
 - selling_price: integer (price in Indian Rupees, e.g. 120000, 550000)
 """
 
-SQL_SYSTEM_PROMPT = f"""
+SQL_SYSTEM_PROMPT = """
 You are an expert database assistant converting user queries about used cars into SQLite queries.
 Use this database schema:
 {DB_SCHEMA}
 
 RULES:
-1. Return ONLY a JSON object containing the key "sql_query". Do not write markdown blocks other than valid JSON.
-2. The query must be a valid SQLite query.
-3. Case-insensitive searches for strings must use LIKE. (e.g., brand LIKE '%maruti%')
-4. Always include a LIMIT clause (max 15 rows) to avoid overwhelming the system.
-5. If the user asks for general recommendations, search by popular filters (e.g., low price, low age, high mileage).
-6. Always select all columns (SELECT * FROM cars ...) so that the frontend comparison table has all properties available.
+1. You must write a valid SQLite query.
+2. Case-insensitive searches for strings must use LIKE. (e.g., brand LIKE '%maruti%')
+3. Always include a LIMIT clause (max 15 rows) to avoid overwhelming the system.
+4. If the user asks for general recommendations, search by popular filters (e.g., low price, low age, high mileage).
+5. Always select all columns (SELECT * FROM cars ...) so that the frontend comparison table has all properties available.
+6. SYNONYM MAPPING: Normalize user slang/shorthand to exact database values:
+   - 'cng' or 'gas' -> fuel_type = 'CNG'
+   - 'petrol' -> fuel_type = 'Petrol'
+   - 'diesel' -> fuel_type = 'Diesel'
+   - 'auto' or 'gearless' -> transmission_type = 'Automatic'
+   - 'manual' or 'gear' -> transmission_type = 'Manual'
+   - If they specify models without spaces (e.g. 'wagonr', 'i20', 'grand'), map them using LIKE (e.g. model LIKE '%Wagon R%' or model LIKE '%i20%' or model LIKE '%Grand%').
 """
 
 RECOMMENDER_SYSTEM_PROMPT = """
@@ -80,6 +89,23 @@ Given the user's request and the list of matching cars returned from the databas
 Keep your response conversational, concise, and formatted in clean Markdown.
 If no cars are returned, explain kindly and suggest adjusting their parameters (e.g. budget, brand).
 """
+
+def sanitize_and_validate_sql(query: str) -> str:
+    """Validate that the query is a SELECT statement and block mutating keywords."""
+    query_clean = query.strip()
+    
+    # Enforce SELECT only
+    if not query_clean.upper().startswith("SELECT"):
+        raise ValueError("Only SELECT queries are allowed.")
+        
+    # Check for mutating keywords
+    forbidden = ["DROP", "DELETE", "UPDATE", "INSERT", "CREATE", "ALTER", "REPLACE", "TRUNCATE"]
+    import re
+    for word in forbidden:
+        if re.search(r'\b' + word + r'\b', query_clean.upper()):
+            raise ValueError(f"Forbidden SQL operation detected: {word}")
+            
+    return query_clean
 
 @app.get("/api/health")
 def health():
@@ -142,21 +168,24 @@ async def chat(request: ChatRequest):
         # Determine active provider
         if gemini_client:
             # === GOOGLE GEMINI (NEW SDK) EXECUTION ===
-            # Step 1: SQL Generation in JSON mode using gemini-2.5-flash
+            # Step 1: SQL Generation using Structured Output schemas
             sql_prompt = f"{SQL_SYSTEM_PROMPT}\nConversation History:\n{history_str}\nUser query: {request.message}"
             sql_response = gemini_client.models.generate_content(
                 model="gemini-2.5-flash",
                 contents=sql_prompt,
                 config=types.GenerateContentConfig(
-                    response_mime_type="application/json"
+                    response_mime_type="application/json",
+                    response_schema=SQLResponseSchema
                 )
             )
-            cleaned_sql_text = clean_json_response(sql_response.text)
-            sql_json = json.loads(cleaned_sql_text)
+            sql_json = json.loads(sql_response.text)
             query = sql_json.get("sql_query")
             
-            # Step 2: Query SQLite database
-            conn = sqlite3.connect(DB_PATH)
+            # Step 2: Validate SQL Query
+            query = sanitize_and_validate_sql(query)
+            
+            # Step 3: Query SQLite database in Read-Only Mode
+            conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             try:
@@ -172,7 +201,7 @@ async def chat(request: ChatRequest):
                 }
             conn.close()
             
-            # Step 3: Explanation & Summary
+            # Step 4: Explanation & Summary
             recommender_prompt = f"{RECOMMENDER_SYSTEM_PROMPT}\nConversation History:\n{history_str}\nUser prompt: {request.message}\nDatabase results: {json.dumps(cars)}"
             recommender_response = gemini_client.models.generate_content(
                 model="gemini-2.5-flash",
@@ -182,22 +211,23 @@ async def chat(request: ChatRequest):
             
         else:
             # === OPENAI EXECUTION ===
-            # Step 1: SQL Generation
+            # Step 1: SQL Generation using Structured Output parse client
             sql_generation_messages = [
                 {"role": "system", "content": SQL_SYSTEM_PROMPT},
                 {"role": "user", "content": f"Conversation History:\n{history_str}\nUser query: {request.message}"}
             ]
-            sql_response = openai_client.chat.completions.create(
+            sql_response = openai_client.beta.chat.completions.parse(
                 model="gpt-4o-mini",
                 messages=sql_generation_messages,
-                response_format={"type": "json_object"}
+                response_format=SQLResponseSchema
             )
-            cleaned_sql_content = clean_json_response(sql_response.choices[0].message.content)
-            sql_json = json.loads(cleaned_sql_content)
-            query = sql_json.get("sql_query")
+            query = sql_response.choices[0].message.parsed.sql_query
             
-            # Step 2: Query SQLite database
-            conn = sqlite3.connect(DB_PATH)
+            # Step 2: Validate SQL Query
+            query = sanitize_and_validate_sql(query)
+            
+            # Step 3: Query SQLite database in Read-Only Mode
+            conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             try:
@@ -213,7 +243,7 @@ async def chat(request: ChatRequest):
                 }
             conn.close()
             
-            # Step 3: Explanation & Summary
+            # Step 4: Explanation & Summary
             recommender_messages = [
                 {"role": "system", "content": RECOMMENDER_SYSTEM_PROMPT},
                 {"role": "user", "content": f"Conversation History:\n{history_str}\nUser prompt: {request.message}\nDatabase results: {json.dumps(cars)}"}
