@@ -99,6 +99,17 @@ def health():
         "database_path": os.path.abspath(DB_PATH) if db_exists else None
     }
 
+def clean_json_response(text: str) -> str:
+    """Helper to strip markdown wrappers like ```json ... ``` and leading/trailing whitespace."""
+    text = text.strip()
+    if text.startswith("```"):
+        first_newline = text.find("\n")
+        if first_newline != -1:
+            text = text[first_newline:].strip()
+        if text.endswith("```"):
+            text = text[:-3].strip()
+    return text
+
 @app.post("/api/chat")
 async def chat(request: ChatRequest):
     if not os.path.exists(DB_PATH):
@@ -118,11 +129,21 @@ async def chat(request: ChatRequest):
         cars = []
         explanation = ""
         
+        # Build conversational history string
+        history_str = ""
+        for msg in request.history:
+            role = "User" if msg.get("sender") == "user" else "Assistant"
+            text_val = msg.get("text", "")
+            # Truncate exceptionally long text blocks if present
+            if len(text_val) > 1000:
+                text_val = text_val[:1000] + "... (truncated)"
+            history_str += f"{role}: {text_val}\n"
+        
         # Determine active provider
         if gemini_client:
             # === GOOGLE GEMINI (NEW SDK) EXECUTION ===
             # Step 1: SQL Generation in JSON mode using gemini-2.5-flash
-            sql_prompt = f"{SQL_SYSTEM_PROMPT}\nUser query: {request.message}"
+            sql_prompt = f"{SQL_SYSTEM_PROMPT}\nConversation History:\n{history_str}\nUser query: {request.message}"
             sql_response = gemini_client.models.generate_content(
                 model="gemini-2.5-flash",
                 contents=sql_prompt,
@@ -130,7 +151,8 @@ async def chat(request: ChatRequest):
                     response_mime_type="application/json"
                 )
             )
-            sql_json = json.loads(sql_response.text)
+            cleaned_sql_text = clean_json_response(sql_response.text)
+            sql_json = json.loads(cleaned_sql_text)
             query = sql_json.get("sql_query")
             
             # Step 2: Query SQLite database
@@ -151,7 +173,7 @@ async def chat(request: ChatRequest):
             conn.close()
             
             # Step 3: Explanation & Summary
-            recommender_prompt = f"{RECOMMENDER_SYSTEM_PROMPT}\nUser prompt: {request.message}\nDatabase results: {json.dumps(cars)}"
+            recommender_prompt = f"{RECOMMENDER_SYSTEM_PROMPT}\nConversation History:\n{history_str}\nUser prompt: {request.message}\nDatabase results: {json.dumps(cars)}"
             recommender_response = gemini_client.models.generate_content(
                 model="gemini-2.5-flash",
                 contents=recommender_prompt
@@ -163,14 +185,15 @@ async def chat(request: ChatRequest):
             # Step 1: SQL Generation
             sql_generation_messages = [
                 {"role": "system", "content": SQL_SYSTEM_PROMPT},
-                {"role": "user", "content": f"User query: {request.message}"}
+                {"role": "user", "content": f"Conversation History:\n{history_str}\nUser query: {request.message}"}
             ]
             sql_response = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=sql_generation_messages,
                 response_format={"type": "json_object"}
             )
-            sql_json = json.loads(sql_response.choices[0].message.content)
+            cleaned_sql_content = clean_json_response(sql_response.choices[0].message.content)
+            sql_json = json.loads(cleaned_sql_content)
             query = sql_json.get("sql_query")
             
             # Step 2: Query SQLite database
@@ -193,7 +216,7 @@ async def chat(request: ChatRequest):
             # Step 3: Explanation & Summary
             recommender_messages = [
                 {"role": "system", "content": RECOMMENDER_SYSTEM_PROMPT},
-                {"role": "user", "content": f"User prompt: {request.message}\nDatabase results: {json.dumps(cars)}"}
+                {"role": "user", "content": f"Conversation History:\n{history_str}\nUser prompt: {request.message}\nDatabase results: {json.dumps(cars)}"}
             ]
             recommender_response = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
