@@ -3,7 +3,7 @@
 .env.local
 
 # Database
-cardekho_cars.db
+# cardekho_cars.db (Committed for Vercel)
 
 # Python
 __pycache__/
