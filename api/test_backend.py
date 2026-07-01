@@ -33,18 +33,23 @@ def test_health_endpoint():
     assert data["status"] == "healthy"
     assert data["database_exists"] is True
 
-def test_chat_without_api_key(monkeypatch):
-    """Verify that the API returns a clear 400 error when OpenAI Key is missing."""
+def test_chat_without_api_keys(monkeypatch):
+    """Verify that the API returns a clear 400 error when both API Keys are missing."""
     monkeypatch.setenv("OPENAI_API_KEY", "")
-    # Re-import or set client in app to None to simulate missing key
+    monkeypatch.setenv("GEMINI_API_KEY", "")
+    
     import api.index
-    # Temporarily remove client object
-    original_client = api.index.client
-    api.index.client = None
+    # Temporarily remove both clients to mock unconfigured state
+    orig_openai = api.index.openai_client
+    orig_gemini = api.index.gemini_client
+    
+    api.index.openai_client = None
+    api.index.gemini_client = None
     
     response = client.post("/api/chat", json={"message": "Show me petrol cars under 5 lakhs"})
     assert response.status_code == 400
-    assert "OpenAI API Key is not configured" in response.json()["detail"]
+    assert "No AI Provider configured" in response.json()["detail"]
     
-    # Restore original client
-    api.index.client = original_client
+    # Restore original clients
+    api.index.openai_client = orig_openai
+    api.index.gemini_client = orig_gemini

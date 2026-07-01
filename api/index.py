@@ -6,27 +6,38 @@ import json
 from openai import OpenAI
 from dotenv import load_dotenv
 
+# Import Google GenAI (New SDK)
+from google import genai
+from google.genai import types
+
 # Load local environment variables from .env if present
 load_dotenv()
 
 app = FastAPI()
 
-# Initialize OpenAI Client (reads OPENAI_API_KEY env)
-# We handle cases where the key might be missing gracefully (especially for early testing)
+# Check which API key is configured
 openai_key = os.getenv("OPENAI_API_KEY")
-client = OpenAI(api_key=openai_key) if openai_key else None
+gemini_key = os.getenv("GEMINI_API_KEY")
 
-# Check where the database file is located. Vercel runs relative to the project root, so we check both levels.
+# Initialize clients
+openai_client = OpenAI(api_key=openai_key) if openai_key else None
+
+if gemini_key:
+    # Initialize the new Google GenAI client
+    gemini_client = genai.Client(api_key=gemini_key)
+else:
+    gemini_client = None
+
+# Check database path
 DB_PATH = 'cardekho_cars.db'
 if not os.path.exists(DB_PATH):
-    # Fallback for nested local testing environments
     DB_PATH = '../cardekho_cars.db'
 
 class ChatRequest(BaseModel):
     message: str
     history: list = []
 
-# Schema description for system prompt guidance
+# Schema definition for system prompt guidance
 DB_SCHEMA = """
 Table Name: cars
 Columns:
@@ -72,76 +83,123 @@ If no cars are returned, explain kindly and suggest adjusting their parameters (
 @app.get("/api/health")
 def health():
     db_exists = os.path.exists(DB_PATH)
+    active_provider = None
+    if gemini_key:
+        active_provider = "Gemini"
+    elif openai_key:
+        active_provider = "OpenAI"
+        
     return {
         "status": "healthy",
-        "openai_configured": client is not None,
+        "openai_configured": openai_client is not None,
+        "gemini_configured": gemini_client is not None,
+        "active_provider": active_provider,
         "database_exists": db_exists,
         "database_path": os.path.abspath(DB_PATH) if db_exists else None
     }
 
 @app.post("/api/chat")
 async def chat(request: ChatRequest):
-    # Ensure database is present
     if not os.path.exists(DB_PATH):
         raise HTTPException(
             status_code=500, 
             detail=f"Database file '{DB_PATH}' not found. Please run the ingestion script 'db_importer.py' first."
         )
         
-    if not client:
+    if not gemini_client and not openai_client:
         raise HTTPException(
             status_code=400,
-            detail="OpenAI API Key is not configured. Please add OPENAI_API_KEY to your .env file."
+            detail="No AI Provider configured. Please add GEMINI_API_KEY or OPENAI_API_KEY to your .env file."
         )
         
     try:
-        # Step 1: LLM generates the SQL
-        sql_generation_messages = [
-            {"role": "system", "content": SQL_SYSTEM_PROMPT},
-            {"role": "user", "content": f"User query: {request.message}"}
-        ]
+        query = None
+        cars = []
+        explanation = ""
         
-        sql_response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=sql_generation_messages,
-            response_format={"type": "json_object"}
-        )
-        
-        sql_json = json.loads(sql_response.choices[0].message.content)
-        query = sql_json.get("sql_query")
-        
-        # Step 2: Query SQLite
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute(query)
-            rows = cursor.fetchall()
-            cars = [dict(r) for r in rows]
-        except Exception as sql_err:
+        # Determine active provider
+        if gemini_client:
+            # === GOOGLE GEMINI (NEW SDK) EXECUTION ===
+            # Step 1: SQL Generation in JSON mode using gemini-2.5-flash
+            sql_prompt = f"{SQL_SYSTEM_PROMPT}\nUser query: {request.message}"
+            sql_response = gemini_client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=sql_prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json"
+                )
+            )
+            sql_json = json.loads(sql_response.text)
+            query = sql_json.get("sql_query")
+            
+            # Step 2: Query SQLite database
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            try:
+                cursor.execute(query)
+                rows = cursor.fetchall()
+                cars = [dict(r) for r in rows]
+            except Exception as sql_err:
+                conn.close()
+                return {
+                    "message": f"I had trouble executing the database query. Try rephrasing your search request! (Failed query details: {sql_err})",
+                    "cars": [],
+                    "sql": query
+                }
             conn.close()
-            return {
-                "message": f"I had trouble executing the database query. Try rephrasing your search request! (Failed query details: {sql_err})",
-                "cars": [],
-                "sql": query
-            }
-        
-        conn.close()
-        
-        # Step 3: LLM explains and summarizes the choices
-        recommender_messages = [
-            {"role": "system", "content": RECOMMENDER_SYSTEM_PROMPT},
-            {"role": "user", "content": f"User prompt: {request.message}\nDatabase results: {json.dumps(cars)}"}
-        ]
-        
-        recommender_response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=recommender_messages
-        )
-        
-        explanation = recommender_response.choices[0].message.content
-        
+            
+            # Step 3: Explanation & Summary
+            recommender_prompt = f"{RECOMMENDER_SYSTEM_PROMPT}\nUser prompt: {request.message}\nDatabase results: {json.dumps(cars)}"
+            recommender_response = gemini_client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=recommender_prompt
+            )
+            explanation = recommender_response.text
+            
+        else:
+            # === OPENAI EXECUTION ===
+            # Step 1: SQL Generation
+            sql_generation_messages = [
+                {"role": "system", "content": SQL_SYSTEM_PROMPT},
+                {"role": "user", "content": f"User query: {request.message}"}
+            ]
+            sql_response = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=sql_generation_messages,
+                response_format={"type": "json_object"}
+            )
+            sql_json = json.loads(sql_response.choices[0].message.content)
+            query = sql_json.get("sql_query")
+            
+            # Step 2: Query SQLite database
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            try:
+                cursor.execute(query)
+                rows = cursor.fetchall()
+                cars = [dict(r) for r in rows]
+            except Exception as sql_err:
+                conn.close()
+                return {
+                    "message": f"I had trouble executing the database query. Try rephrasing your search request! (Failed query details: {sql_err})",
+                    "cars": [],
+                    "sql": query
+                }
+            conn.close()
+            
+            # Step 3: Explanation & Summary
+            recommender_messages = [
+                {"role": "system", "content": RECOMMENDER_SYSTEM_PROMPT},
+                {"role": "user", "content": f"User prompt: {request.message}\nDatabase results: {json.dumps(cars)}"}
+            ]
+            recommender_response = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=recommender_messages
+            )
+            explanation = recommender_response.choices[0].message.content
+            
         return {
             "message": explanation,
             "cars": cars,
@@ -149,4 +207,6 @@ async def chat(request: ChatRequest):
         }
         
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))

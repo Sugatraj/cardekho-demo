@@ -178,7 +178,7 @@ export default function App() {
           </div>
 
           {/* Shortlist Comparison Section */}
-          <div class="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-4 flex flex-col h-[280px]">
+          <div class="bg-slate-900/60 border border-s late-800/80 rounded-2xl p-4 flex flex-col h-[280px]">
             <h2 class="text-sm font-semibold uppercase tracking-wider text-slate-400 mb-3 flex items-center justify-between">
               <span>Shortlist & Compare ({shortlist.length})</span>
               {shortlist.length > 0 && (
