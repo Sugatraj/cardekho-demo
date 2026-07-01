@@ -67,6 +67,7 @@ RULES:
 3. Case-insensitive searches for strings must use LIKE. (e.g., brand LIKE '%maruti%')
 4. Always include a LIMIT clause (max 15 rows) to avoid overwhelming the system.
 5. If the user asks for general recommendations, search by popular filters (e.g., low price, low age, high mileage).
+6. Always select all columns (SELECT * FROM cars ...) so that the frontend comparison table has all properties available.
 """
 
 RECOMMENDER_SYSTEM_PROMPT = """
